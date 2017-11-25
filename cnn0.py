@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 # coding: utf-8
+import sys
 import tensorflow as tf
 from astropy.io import fits
 import csv
@@ -8,14 +9,21 @@ import tempfile
 import numpy as np
 import datetime
 import shutil
+from datetime import date
 
 label_dict = {'noise':0, 'broad':0, 'signa':1, 'lowsnr':-1}
 file_label_map = {} #fname-> label
-root_file_dir = "./Combined"
-label_filename = root_file_dir + "/labels.csv"
+labeled_file_dir = "./Combined"
+unlabeled_file_dir = "./generated_fits"
+label_filename = labeled_file_dir + "/labels.csv"
 misclassified_dir = "./misclassified/"
 no_image_found_file = "noCorrespondingPNG.txt"
+saved_model_dir = "./saved_models/"
+prediction_dir = "./predictions"
+noise_prediction_dir = prediction_dir + "/noise"
+signal_prediction_dir = prediction_dir + "/signal"
 
+num_distinct_labels = 2
 num_noise_training_samples = 45459
 num_signal_training_samples = 4824
 BATCH_SIZE = 500
@@ -32,11 +40,23 @@ def make_file_label_map():
             fname, label = row
             file_label_map[fname] = int(label)
 
-def get_data(fname):
+def file_contents(fname):
     hdulist = fits.open(fname, memmap=False)
     data = hdulist[0].data
     hdulist.close()
     return data
+
+def get_and_normalize_data(fullpath):
+    if not fullpath.endswith(".fits"):
+        return None
+    x = file_contents(fullpath)
+    try:
+        assert x.shape == (16,512)
+    except AssertionError:
+        print "File {0} is of size {1} instead of (16,512), so it won't be used".format(fullpath, x.shape)
+        return None
+    x = normalize_images(x) #trying whitening on single image level
+    return x
 
 def normalize_images(images):
     avg = np.mean(images)
@@ -44,62 +64,72 @@ def normalize_images(images):
     images = (images-avg)/stddev
     return images
 
-#bootstrap data
-def get_data_from_files():
+def prepare_unlabeled_data(root_file_dir):
+    xs = []
+    filenames = []
+    for subdir, dirs, files in os.walk(root_file_dir):
+        for file in files:
+            fullpath = os.path.join(subdir, file)
+            x = get_and_normalize_data(fullpath)
+            if x is None:
+                continue
+            xs.append(x)
+            filenames.append(fullpath)
+    return np.array(xs), np.array(filenames)
+
+def prepare_training_data(root_file_dir):
+    #assumes following directory structure with three levels below working directory i.e.: ./Combined/noise/HIP1324_1
     s_n_data_ratio = float(num_noise_training_samples)/num_signal_training_samples #change when we add more data
     std_dev = s_n_data_ratio/3.5 # set so that getting random value < 0 is very rare
-    num_distinct_labels = 2
     xs = []
     ys = []
     d = {}
-    s = 0
     unique_id = 1
     for subdir, dirs, files in os.walk(root_file_dir):
         dir_names = subdir.split("/")
-        if len(dir_names) >= 4:
-            lowest_dir_name = dir_names[3]
-        else:
-            # not in the level of directory where data is
+        if len(dir_names) < 4: # not in the level of directory where data is
             continue
+        lowest_dir_name = dir_names[-1]
         for file in files:
             # if len(xs) >= 1000:
             #     break
-            if not file.endswith(".fits"):
-                continue
-            fullpath = os.path.join(subdir, file)
             filenumber = file[:-5]
             fname = lowest_dir_name + "_" + filenumber
             if fname in file_label_map:
-                x = get_data(fullpath)
-                assert x.shape == (16,512)
-                x = normalize_images(x) #trying whitening on single image level
-                # x = x.reshape(16*512, 1)
-                y = file_label_map[fname]
+                fullpath = os.path.join(subdir, file) 
+                x = get_and_normalize_data(fullpath)
+                if x is None:
+                    continue
+                class_label = file_label_map[fname]
                 y_vec = np.zeros((num_distinct_labels, num_distinct_labels))
-                y_vec[0][y] = 1
+                y_vec[0][class_label] = 1
                 y_vec[1][0] = unique_id
                 d[unique_id] = fullpath
                 unique_id += 1
-                number_to_add = 1 if y == 0 else int(np.random.normal(s_n_data_ratio, std_dev))
-                if y == 0:  
+                number_to_add = 1 if class_label == 0 else int(np.random.normal(s_n_data_ratio, std_dev))
+                if class_label == 0:  
                     xs.append(x)
                     ys.append(y_vec)
-                if y == 1:
+                if class_label == 1:
                     xs += number_to_add * [x]
                     ys += number_to_add * [y_vec]
     return np.array(xs), np.array(ys), d
 
-def copy_files_to_folder(misclassified_set):
+def copy_files_to_folder(files, directory, png = True):
     len_extension = len(".fits")
     
-    shutil.rmtree(misclassified_dir, ignore_errors=True)
-    os.makedirs(misclassified_dir)
+    shutil.rmtree(directory, ignore_errors=True)
+    os.makedirs(directory)
 
-    for file in misclassified_set:
-        without_extension = file[:len(file) - len_extension]
-        png_filename = without_extension + ".png"
+    for file in files:
+        if png:
+            without_extension = file[:len(file) - len_extension]
+            filename = without_extension + ".png"
+        else:
+            filename = file
+
         try:
-            shutil.copy2(png_filename, misclassified_dir)
+            shutil.copy2(filename, directory)
         except IOError:
             with open(no_image_found_file, "a") as f:
                 f.write(file)
@@ -198,9 +228,9 @@ def build_cnn(x):
     h_pool3_flat = tf.reshape(h_pool3, [-1, dim])
     h_fc1 = tf.nn.relu(tf.matmul(h_pool3_flat, W_fc1) + b_fc1)
 
-    with tf.name_scope('dropout'):
-        keep_prob = tf.placeholder(tf.float32)
-        h_fc1_drop = tf.nn.dropout(h_fc1, keep_prob)
+    # with tf.name_scope('dropout'):
+    keep_prob = tf.placeholder(tf.float32, name = "keep_prob")
+    h_fc1_drop = tf.nn.dropout(h_fc1, keep_prob)
 
     # Map the 128 features to 2 classes, one for each type of signal
     with tf.name_scope('fc2'):
@@ -208,6 +238,7 @@ def build_cnn(x):
         b_fc2 = bias_variable([2])
 
     y_conv = tf.matmul(h_fc1_drop, W_fc2) + b_fc2
+    y_conv = tf.identity(y_conv, name="y_conv")
     return y_conv, keep_prob
 
 def build_graph(x, y_):
@@ -240,14 +271,17 @@ def train_and_test(tensor_tup, x, y_, xs, ys, d):
     # accuracy, keep_prob, train_step, cross_entropy, merged_summary_op, correct_prediction = tensor_tup
     training_data, test_data = split_data_train_test(xs, ys)
 
-    saver = tf.train.Saver()
+    # saver = tf.train.Saver()
+    dirname = saved_model_dir + str(datetime.datetime.now()) + "/"
+    builder = tf.saved_model.builder.SavedModelBuilder(dirname)
     with tf.Session() as sess:
         sess.run(tf.global_variables_initializer())
         train(sess, training_data, tensor_tup, x, y_)
-        misclassified_set, full_accuracy = test(test_data, tensor_tup, x, y_, d)
+        misclassified_files, full_accuracy = test(test_data, tensor_tup, x, y_, d)
         print('test accuracy %g' % full_accuracy)
-        save_path = saver.save(sess, "./saved_models/" + str(full_accuracy) + "-" + str(datetime.datetime.now()))
-    return misclassified_set
+        builder.add_meta_graph_and_variables(sess, [tf.saved_model.tag_constants.SERVING])
+    builder.save()
+    return files
 
 def train(sess, training_data, tensor_tup, x, y_):
     accuracy, keep_prob, train_step, cross_entropy, merged_summary_op, correct_prediction = tensor_tup
@@ -271,7 +305,7 @@ def train(sess, training_data, tensor_tup, x, y_):
         y_batch = training_data[1][batch_counter: batch_counter + BATCH_SIZE, 0, :]
 
         train_accuracy = accuracy.eval(feed_dict={
-            x: x_batch, y_: y_batch, keep_prob: 1.0})
+            x: x_batch, y_: y_batch, keep_prob: 1.0}, session=sess)
         batch_accuracy += train_accuracy
         _, c, summary = sess.run([train_step, cross_entropy, merged_summary_op], 
                             feed_dict={x: x_batch, y_: y_batch, keep_prob: 0.5})
@@ -284,7 +318,7 @@ def test(test_data, tensor_tup, x, y_, d):
     accuracy, keep_prob, train_step, cross_entropy, merged_summary_op, correct_prediction = tensor_tup
     batch_counter = accumulated_accuracy_sum = contributing_test_batches = 0
     orig_len = test_data[0].shape[0]
-    misclassified_set = set()
+    misclassified_files = set()
     while batch_counter < orig_len:
         x_test_batch = test_data[0][batch_counter: batch_counter + BATCH_SIZE, :, :]
         y_test_batch = test_data[1][batch_counter: batch_counter + BATCH_SIZE, 0, :]
@@ -296,7 +330,7 @@ def test(test_data, tensor_tup, x, y_, d):
             if (boolean.eval() != 1.0): # incorrect prediction
                 unique_id = test_data[1][batch_counter + idx, 1, 0]
                 fullpath = d[unique_id]
-                misclassified_set.add(fullpath)
+                misclassified_files.add(fullpath)
 
         acc = tf.reduce_mean(corr_pred).eval()
 
@@ -305,18 +339,65 @@ def test(test_data, tensor_tup, x, y_, d):
         contributing_test_batches += 1 * ratio
         batch_counter += BATCH_SIZE
     full_accuracy = float(accumulated_accuracy_sum)/contributing_test_batches if contributing_test_batches != 0 else -1
-    return misclassified_set, full_accuracy
+    if full_accuracy == -1:
+        print "No testing actually done, not enough data"
+    return misclassified_files, full_accuracy
+
+
+def classifyAll(xs, filenames):
+    dirname = get_last_saved_dir()
+    noise = set()
+    signal = set()
+    with tf.Session(graph=tf.Graph()) as sess:
+        tf.saved_model.loader.load(sess, [tf.saved_model.tag_constants.SERVING], dirname)
+        x = sess.graph.get_tensor_by_name("x:0")
+        keep_prob = sess.graph.get_tensor_by_name("keep_prob:0")
+        y_conv = sess.graph.get_tensor_by_name("y_conv:0")
+        pred = tf.argmax(y_conv.eval(feed_dict = {x: xs, keep_prob: 1.0}), 1).eval()
+        for filename, class_label in zip(filenames, pred):
+            if class_label == 0:
+                noise.add(filename)
+            else:
+                signal.add(filename)
+    return noise, signal
+
+
+def get_last_saved_dir():
+    last_dir = None
+    max_time = 0
+    for subdir, dirs, files in os.walk(saved_model_dir):
+        if subdir == saved_model_dir:
+            continue
+        modified_time = os.path.getmtime(subdir)
+        if modified_time > max_time:
+            last_dir = subdir
+            max_time = modified_time
+    return last_dir
 
 def main():
-    make_file_label_map()
-    xs, ys, d = get_data_from_files()
+    args = sys.argv
+    if len(args) < 2:
+        print "Specify mode with command line argument 'c' or 't'"
+        return
+    mode = args[1]
+    if mode == 't':
+        print "Reading and training on files from {0}".format(labeled_file_dir)
+        make_file_label_map()
+        xs, ys, d = prepare_training_data(labeled_file_dir)
+        x = tf.placeholder(tf.float32, [None, 16, 512], name="x")
+        y_ = tf.placeholder(tf.float32, [None, 2]) #noise/broad, signal, lowsnr
+        tensor_tup = build_graph(x, y_)
+        misclassified_files = train_and_test(tensor_tup, x, y_, xs, ys, d)
+        copy_files_to_folder(misclassified_files, misclassified_dir)
+    elif mode == 'c':
+        print "Reading and classifying files from {0}".format(unlabeled_file_dir)
+        xs, filenames = prepare_unlabeled_data(unlabeled_file_dir)
+        noise, signal = classifyAll(xs, filenames)
+        copy_files_to_folder(noise, noise_prediction_dir, png = False)
+        copy_files_to_folder(signal, signal_prediction_dir, png = False)
+    else:
+        print "Mode not recognized"
 
-    x = tf.placeholder(tf.float32, [None, 16, 512])
-    y_ = tf.placeholder(tf.float32, [None, 2]) #noise/broad, signal, lowsnr
-    tensor_tup = build_graph(x, y_)
-    misclassified_set = train_and_test(tensor_tup, x, y_, xs, ys, d)
-
-    copy_files_to_folder(misclassified_set)
 
 if __name__ == "__main__":
     main()
