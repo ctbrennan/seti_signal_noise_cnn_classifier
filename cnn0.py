@@ -10,26 +10,44 @@ import numpy as np
 import datetime
 import shutil
 from datetime import date
+from generate_fits import split_file_generator
+from scipy import misc
 
 label_dict = {'noise':0, 'broad':0, 'signa':1, 'lowsnr':-1}
-file_label_map = {} #fname-> label
 labeled_file_dir = "./Combined"
 unlabeled_file_dir = "./generated_fits"
 label_filename = labeled_file_dir + "/labels.csv"
-misclassified_dir = "./misclassified/"
+
 no_image_found_file = "noCorrespondingPNG.txt"
-saved_model_dir = "./saved_models/"
+testing_classification_dir = "./testing"
+correctly_classified_dir = testing_classification_dir + "/correctly_classified"
+misclassified_dir = testing_classification_dir + "/misclassified"
+correct_noise_dir = correctly_classified_dir + "/noise"
+correct_signal_dir = correctly_classified_dir + "/signal"
+incorrect_noise_dir = misclassified_dir + "/noise"
+incorrect_signal_dir = misclassified_dir + "/signal"
+
 prediction_dir = "./predictions"
 noise_prediction_dir = prediction_dir + "/noise"
 signal_prediction_dir = prediction_dir + "/signal"
 
-num_distinct_labels = 2
-num_noise_training_samples = 45459
-num_signal_training_samples = 4824
+saved_model_dir = "./saved_models"
+
+NUM_DISTINCT_LABELS = 2
+NUM_NOISE_TRAINING = 45459
+NUM_SIGNAL_TRAINING = 4824
+SN_DATA_RATIO = float(NUM_NOISE_TRAINING)/NUM_SIGNAL_TRAINING #change when we add more data
 BATCH_SIZE = 500
-NUM_ITERATIONS = 2000
+NUM_ITERATIONS = 1500#2000
 
 def make_file_label_map():
+    """
+    ARGS - None
+    RET - dictionary to map filename -> signal/noise label
+    Side effects - 
+    reads from csv file
+    """
+    file_label_map = {} #fname-> label
     with open(label_filename, 'rb') as csvfile:
         reader = csv.reader(csvfile, delimiter=',')
         first = True
@@ -39,14 +57,25 @@ def make_file_label_map():
                 continue
             fname, label = row
             file_label_map[fname] = int(label)
+    return file_label_map
 
 def file_contents(fname):
+    """
+    ARG1 - String - relative filename of .fits file
+    RET - ndarray
+    """
     hdulist = fits.open(fname, memmap=False)
     data = hdulist[0].data
     hdulist.close()
     return data
 
 def get_and_normalize_data(fullpath):
+    """
+    ARG1 - String - Relative filename of .fits file of dimension (16, 512)
+    RET - (ndarray - normalized image)
+    Error RET - None
+
+    """
     if not fullpath.endswith(".fits"):
         return None
     x = file_contents(fullpath)
@@ -55,16 +84,25 @@ def get_and_normalize_data(fullpath):
     except AssertionError:
         print "File {0} is of size {1} instead of (16,512), so it won't be used".format(fullpath, x.shape)
         return None
-    x = normalize_images(x) #trying whitening on single image level
+    x = normalize_image(x) #trying whitening on single image level
     return x
 
-def normalize_images(images):
-    avg = np.mean(images)
-    stddev = np.std(images)
-    images = (images-avg)/stddev
-    return images
+def normalize_image(image):
+    """
+    ARG1 - ndarray - 2d image
+    RET -  de-meaned image scaled so that its pixel values have std. dev. of 1
+    """
+    avg = np.mean(image)
+    stddev = np.std(image)
+    image = (image-avg)/stddev
+    return image
 
 def prepare_unlabeled_data(root_file_dir):
+    """
+    ARG1 - Directory name in which to find .fits files
+    RET1 - array of normalized images (ndarrays)
+    RET2 - array of files from which those images came
+    """
     xs = []
     filenames = []
     for subdir, dirs, files in os.walk(root_file_dir):
@@ -78,50 +116,100 @@ def prepare_unlabeled_data(root_file_dir):
     return np.array(xs), np.array(filenames)
 
 def prepare_training_data(root_file_dir):
-    #assumes following directory structure with three levels below working directory i.e.: ./Combined/noise/HIP1324_1
-    s_n_data_ratio = float(num_noise_training_samples)/num_signal_training_samples #change when we add more data
-    std_dev = s_n_data_ratio/3.5 # set so that getting random value < 0 is very rare
+    """
+    ARG1 - Directory name in which to find .fits files
+    RET1 - array of normalized images (ndarrays)
+    RET2 - array of ndarrays containing one-hot label vectors which also map image to a unique numeric id for use in dictionary d
+    RET3 - dictionary which maps unique numeric id of image to (fullpath, class_label, fname)
+
+    Note: bootstraps signal data so that RET1 has roughly as many signal images as noise images
+    Note: assumes following directory structure with three levels below working directory i.e.: ./Combined/noise/HIP1324_1
+    """
     xs = []
     ys = []
     d = {}
-    unique_id = 1
-    for subdir, dirs, files in os.walk(root_file_dir):
-        dir_names = subdir.split("/")
-        if len(dir_names) < 4: # not in the level of directory where data is
+    file_label_map = make_file_label_map()
+    file_tuples = get_all_fits_info(root_file_dir, file_label_map)
+    for unique_id, (fullpath, fname) in enumerate(file_tuples):
+        x = get_and_normalize_data(fullpath)
+        if x is None:
             continue
+        class_label = file_label_map[fname]
+        d[unique_id] = (fullpath, class_label, fname)
+        y_vec = make_y_vec(class_label, unique_id)
+        if class_label == 0:  
+            xs.append(x)
+            ys.append(y_vec)
+        if class_label == 1:
+            bootstrap_signal(xs, ys, x, y_vec)
+    return np.array(xs), np.array(ys), d
+
+def make_y_vec(class_label, unique_id):
+    """
+    ARG1 - integer class label
+    ARG2 - unique numeric id for particular file
+    RET - 2x2 matrix where first row is one-hot label vector, second row first column has unique id
+    """
+    y_vec = np.zeros((NUM_DISTINCT_LABELS, NUM_DISTINCT_LABELS))
+    y_vec[0][class_label] = 1
+    y_vec[1][0] = unique_id
+    return y_vec
+
+def bootstrap_signal(xs, ys, x, y_vec):
+    """
+    ARG1 - list of image ndarrays
+    ARG2 - list of label ndarrays
+    ARG3 - new image (labeled signal) to be added to ndarray some number of times according to a normal distribution
+    ARG4 - new image label to be added the same number of times
+    """
+    std_dev = SN_DATA_RATIO/3.5 # set so that getting random value < 0 is very rare
+    number_to_add = int(np.random.normal(SN_DATA_RATIO, std_dev))
+    xs += number_to_add * [x]
+    ys += number_to_add * [y_vec]
+
+def get_all_fits_info(directory, file_label_map, stop_short_count=None):
+    """
+    ARG1 - root directory in which to look for .fits files
+    ARG2 (optional) - For testing purposes, a number of files to find so we can stop short
+    
+    RET - List of tuples of (fullpath, fname)
+    Ex: If path of file found is ./Combined/noise/HIP1324_1/455634944.fits then
+    fullpath = ./Combined/noise/HIP1324_1/455634944.fits 
+    fname = HIP1324_1_455634944
+    """
+    file_tuples = []
+    for subdir, dirs, files in os.walk(directory):
+        dir_names = subdir.split("/")
         lowest_dir_name = dir_names[-1]
         for file in files:
-            # if len(xs) >= 1000:
-            #     break
+            if stop_short_count and len(file_tuples) >= stop_short_count:
+                break
+            if not file.endswith(".fits"):
+                continue
             filenumber = file[:-5]
             fname = lowest_dir_name + "_" + filenumber
             if fname in file_label_map:
-                fullpath = os.path.join(subdir, file) 
-                x = get_and_normalize_data(fullpath)
-                if x is None:
-                    continue
-                class_label = file_label_map[fname]
-                y_vec = np.zeros((num_distinct_labels, num_distinct_labels))
-                y_vec[0][class_label] = 1
-                y_vec[1][0] = unique_id
-                d[unique_id] = fullpath
-                unique_id += 1
-                number_to_add = 1 if class_label == 0 else int(np.random.normal(s_n_data_ratio, std_dev))
-                if class_label == 0:  
-                    xs.append(x)
-                    ys.append(y_vec)
-                if class_label == 1:
-                    xs += number_to_add * [x]
-                    ys += number_to_add * [y_vec]
-    return np.array(xs), np.array(ys), d
+                fullpath = os.path.join(subdir, file)
+                file_tuples.append((fullpath, fname))
+    return file_tuples
+
 
 def copy_files_to_folder(files, directory, png = True):
-    len_extension = len(".fits")
+    """
+    ARG1 - list of tuples where first index is filename, second is filename with directory 
+    ex: [(46969856, GJ1002_1_46969856)]
     
+    RET - None
+
+    Side Effects - 
+    deletes given directory
+    copies .fits or .png with paths given in files to a given directory 
+    """
+    len_extension = len(".fits")
     shutil.rmtree(directory, ignore_errors=True)
     os.makedirs(directory)
 
-    for file in files:
+    for file, fname_with_dir in files:
         if png:
             without_extension = file[:len(file) - len_extension]
             filename = without_extension + ".png"
@@ -130,9 +218,67 @@ def copy_files_to_folder(files, directory, png = True):
 
         try:
             shutil.copy2(filename, directory)
+            file_number = filename.split("/")[-1]
+            os.rename(directory + "/" + file_number, directory + "/" + fname_with_dir + ".png")
         except IOError:
             with open(no_image_found_file, "a") as f:
                 f.write(file)
+
+def write_image_arrs_to_png(image_tups, directory, remake_dir = False):
+    """
+    ARG1 - list of image tuples of format (data array, filename)
+    ARG2 - directory to which we write png
+    ARG3 - (optional) boolean for whether we're deleting the given directory first
+    RET - None
+    Side effect - possibly deletes directory
+    writes images in png format to given directory
+    if "images" are of greater than 2 dimensions, treats ndarray as 2d images stacked on top of each other
+    """
+    if remake_dir or not os.path.isdir(directory):
+        shutil.rmtree(directory, ignore_errors=True)
+        os.makedirs(directory)
+
+    for data_arr, fname in image_tups:
+        if len(data_arr.shape) == 1:
+            data_arr = np.reshape(data_arr, (data_arr.shape[0], 1))
+        if len(data_arr.shape) == 3:
+            for dim in range(data_arr.shape[2]):
+                write_image_arr_to_png(data_arr[:,:,dim], directory+"/"+fname+"-"+str(dim))
+        else:
+            write_image_arr_to_png(data_arr, directory + "/" + fname)
+
+def write_image_arr_to_png(data_arr, fullpath):
+    misc.imsave(fullpath, data_arr, format = "png")
+
+def find_all_fil(directory = "."):
+    """
+    ARG1 - Directory to look in
+    RET - List of paths where filterbank files can be found
+    """
+    fils = []
+    for subdir, dirs, files in os.walk(directory):
+        for file in files:
+            if file.endswith(".fil"):
+                fullpath = os.path.join(subdir, file)
+                fils.append(fullpath)
+    return fils
+
+
+def recent_model_directory(directory = saved_model_dir):
+    """
+    ARG1 - Directory in which to look
+    RET - Directory where the most recently modified file containing saved model was found
+    """
+    last_dir = None
+    max_time = 0
+    for subdir, dirs, files in os.walk(directory):
+        if subdir == saved_model_dir:
+            continue
+        modified_time = os.path.getmtime(subdir)
+        if modified_time > max_time:
+            last_dir = subdir
+            max_time = modified_time
+    return last_dir
 
 def shuffle_in_unison(a, b):
     #https://stackoverflow.com/q/4601373
@@ -171,10 +317,10 @@ def bias_variable(shape):
 def build_cnn(x):
     """
 
-    ARG 1: a normalized input tensor with the dimensions (N_examples, 16, 512)
+    ARG1: a normalized input tensor with the dimensions (N_examples, 16, 512)
 
-    RET 1: tensor of shape (N_examples, 2)
-    RET 2: scalar placeholder for the probability of dropout
+    RET1: tensor of shape (N_examples, 2)
+    RET2: scalar placeholder for the probability of dropout
     """
     # pool by factor of two along frequency dimension -> bring dimension down to 128, max or average
     # more convolutional, either no fully connected or just later
@@ -187,6 +333,7 @@ def build_cnn(x):
         W_conv1 = weight_variable([3, 3, 1, 32])
         b_conv1 = bias_variable([32])
         h_conv1 = tf.nn.relu(conv2d_downsample_freq(x_image, W_conv1) + b_conv1)
+        h_conv1 = tf.identity(h_conv1, name="h_conv1")
 
     # Pooling layer - downsamples by 2X.
     with tf.name_scope('pool1'):
@@ -197,6 +344,7 @@ def build_cnn(x):
         W_conv2 = weight_variable([3, 3, 32, 64])
         b_conv2 = bias_variable([64])
         h_conv2 = tf.nn.relu(conv2d_downsample_freq(h_pool1, W_conv2, ) + b_conv2)
+        h_conv2 = tf.identity(h_conv2, name="h_conv2")
 
     # Second pooling layer.
     with tf.name_scope('pool2'):
@@ -208,6 +356,7 @@ def build_cnn(x):
         W_conv3 = weight_variable([3, 3, 64, 128])
         b_conv3 = bias_variable([128])
         h_conv3 = tf.nn.relu(conv2d_downsample_freq(h_pool2, W_conv3, ) + b_conv3)
+        h_conv3 = tf.identity(h_conv3, name="h_conv3")
 
     # Third pooling layer.
     with tf.name_scope('pool3'):
@@ -227,6 +376,7 @@ def build_cnn(x):
 
     h_pool3_flat = tf.reshape(h_pool3, [-1, dim])
     h_fc1 = tf.nn.relu(tf.matmul(h_pool3_flat, W_fc1) + b_fc1)
+    h_fc1 = tf.identity(h_fc1, name = "h_fc1")
 
     # with tf.name_scope('dropout'):
     keep_prob = tf.placeholder(tf.float32, name = "keep_prob")
@@ -272,16 +422,16 @@ def train_and_test(tensor_tup, x, y_, xs, ys, d):
     training_data, test_data = split_data_train_test(xs, ys)
 
     # saver = tf.train.Saver()
-    dirname = saved_model_dir + str(datetime.datetime.now()) + "/"
+    dirname = saved_model_dir + "/" + str(datetime.datetime.now()) + "/"
     builder = tf.saved_model.builder.SavedModelBuilder(dirname)
     with tf.Session() as sess:
         sess.run(tf.global_variables_initializer())
         train(sess, training_data, tensor_tup, x, y_)
-        misclassified_files, full_accuracy = test(test_data, tensor_tup, x, y_, d)
+        misclassified_files, correctly_classified_files, full_accuracy = test(test_data, tensor_tup, x, y_, d)
         print('test accuracy %g' % full_accuracy)
         builder.add_meta_graph_and_variables(sess, [tf.saved_model.tag_constants.SERVING])
     builder.save()
-    return files
+    return misclassified_files, correctly_classified_files
 
 def train(sess, training_data, tensor_tup, x, y_):
     accuracy, keep_prob, train_step, cross_entropy, merged_summary_op, correct_prediction = tensor_tup
@@ -318,7 +468,11 @@ def test(test_data, tensor_tup, x, y_, d):
     accuracy, keep_prob, train_step, cross_entropy, merged_summary_op, correct_prediction = tensor_tup
     batch_counter = accumulated_accuracy_sum = contributing_test_batches = 0
     orig_len = test_data[0].shape[0]
-    misclassified_files = set()
+    mis_noise = set()
+    mis_signal = set()
+    corr_noise = set()
+    corr_signal = set()
+    
     while batch_counter < orig_len:
         x_test_batch = test_data[0][batch_counter: batch_counter + BATCH_SIZE, :, :]
         y_test_batch = test_data[1][batch_counter: batch_counter + BATCH_SIZE, 0, :]
@@ -327,10 +481,23 @@ def test(test_data, tensor_tup, x, y_, d):
             x: x_test_batch, y_: y_test_batch, keep_prob: 1.0})
         
         for idx, boolean in enumerate(tf.unstack(corr_pred)):
+            unique_id = test_data[1][batch_counter + idx, 1, 0]
+            fullpath, class_label, fname = d[unique_id]
+            tup = (fullpath, fname)
             if (boolean.eval() != 1.0): # incorrect prediction
-                unique_id = test_data[1][batch_counter + idx, 1, 0]
-                fullpath = d[unique_id]
-                misclassified_files.add(fullpath)
+                if class_label == 0:
+                    mis_noise.add(tup)
+                else:
+                    mis_signal.add(tup)    
+            else:
+                if class_label == 0:
+                    corr_noise.add(tup)
+                else:
+                    # l = len(corr_signal)
+                    corr_signal.add(tup)
+                    # if l + 1 == len(corr_signal):
+                        # normalized_img = 
+
 
         acc = tf.reduce_mean(corr_pred).eval()
 
@@ -341,11 +508,13 @@ def test(test_data, tensor_tup, x, y_, d):
     full_accuracy = float(accumulated_accuracy_sum)/contributing_test_batches if contributing_test_batches != 0 else -1
     if full_accuracy == -1:
         print "No testing actually done, not enough data"
-    return misclassified_files, full_accuracy
+    misclassified_files = [mis_noise, mis_signal]
+    correctly_classified_files = [corr_noise, corr_signal]
+    return misclassified_files, correctly_classified_files, full_accuracy
 
 
-def classifyAll(xs, filenames):
-    dirname = get_last_saved_dir()
+def classify_all_fits_files(xs, filenames):
+    dirname = recent_model_directory()
     noise = set()
     signal = set()
     with tf.Session(graph=tf.Graph()) as sess:
@@ -353,26 +522,68 @@ def classifyAll(xs, filenames):
         x = sess.graph.get_tensor_by_name("x:0")
         keep_prob = sess.graph.get_tensor_by_name("keep_prob:0")
         y_conv = sess.graph.get_tensor_by_name("y_conv:0")
-        pred = tf.argmax(y_conv.eval(feed_dict = {x: xs, keep_prob: 1.0}), 1).eval()
-        for filename, class_label in zip(filenames, pred):
-            if class_label == 0:
-                noise.add(filename)
-            else:
-                signal.add(filename)
+        i = 0
+        while i < len(xs):
+            batch = xs[i:i+BATCH_SIZE]
+            filename_batch = filenames[i:i+BATCH_SIZE]
+            pred = tf.argmax(y_conv.eval(feed_dict = {x: batch, keep_prob: 1.0}), 1).eval()
+            for filename, class_label in zip(filename_batch, pred):
+                if class_label == 0:
+                    noise.add(filename)
+                else:
+                    signal.add(filename)
+            i += BATCH_SIZE
+       
     return noise, signal
 
+def classify_lazily(write_signal = False):
+    dirname = recent_model_directory()
+    print "Most recent saved model coming from {0}".format(dirname)
+    filenames = find_all_fil()
+    noise = []
+    signal = []
+    with tf.Session(graph=tf.Graph()) as sess:
+        tf.saved_model.loader.load(sess, [tf.saved_model.tag_constants.SERVING], dirname)
+        x = sess.graph.get_tensor_by_name("x:0")
+        keep_prob = sess.graph.get_tensor_by_name("keep_prob:0")
+        y_conv = sess.graph.get_tensor_by_name("y_conv:0")
+        h_conv1 = sess.graph.get_tensor_by_name("conv1/h_conv1:0")
+        h_conv2 = sess.graph.get_tensor_by_name("conv2/h_conv2:0")
+        h_conv3 = sess.graph.get_tensor_by_name("conv3/h_conv3:0")
+        fc1 = sess.graph.get_tensor_by_name("h_fc1:0")
 
-def get_last_saved_dir():
-    last_dir = None
-    max_time = 0
-    for subdir, dirs, files in os.walk(saved_model_dir):
-        if subdir == saved_model_dir:
-            continue
-        modified_time = os.path.getmtime(subdir)
-        if modified_time > max_time:
-            last_dir = subdir
-            max_time = modified_time
-    return last_dir
+        
+        for file in filenames:
+            print "Reading lazily and classifying from {0}".format(file)
+            file_number = 0
+            for batch in split_file_generator(file, frequency_dimension=512, count = 10000, NUM_PARTS = 100):
+                normalized_batch = [normalize_image(image_arr) for image_arr in batch]
+                act1 = h_conv1.eval(feed_dict = {x: normalized_batch, keep_prob:1.0})
+                act2 = h_conv2.eval(feed_dict = {x: normalized_batch, keep_prob:1.0})
+                act3 = h_conv3.eval(feed_dict = {x: normalized_batch, keep_prob:1.0})
+                act_fc = fc1.eval(feed_dict = {x: normalized_batch, keep_prob:1.0})
+                pred = tf.argmax(y_conv.eval(feed_dict = {x: normalized_batch, keep_prob: 1.0}), 1).eval()
+                for image_arr, class_label, act1, act2, act3, act_fc in zip(batch, pred, act1, act2, act3, act_fc):
+                    part_filename = file + str(file_number)
+                    image_tup = (image_arr, part_filename)
+                    act_tup1 = (act1, part_filename + "-conv1")
+                    act_tup2 = (act2, part_filename + "-conv2")
+                    act_tup3 = (act3, part_filename + "-conv3")
+                    act_tupfc = (act_fc, part_filename + "-fc1")
+                    if class_label == 0:
+                        noise.append(image_tup)
+                    else:
+                        signal.append(image_tup)
+                        signal.append(act_tup1)
+                        signal.append(act_tup2)
+                        signal.append(act_tup3)
+                        signal.append(act_tupfc)
+                    file_number += 1
+                if write_signal:
+                    write_image_arrs_to_png(signal, signal_prediction_dir)
+                    signal = []
+       
+    return noise, signal
 
 def main():
     args = sys.argv
@@ -382,19 +593,35 @@ def main():
     mode = args[1]
     if mode == 't':
         print "Reading and training on files from {0}".format(labeled_file_dir)
-        make_file_label_map()
         xs, ys, d = prepare_training_data(labeled_file_dir)
         x = tf.placeholder(tf.float32, [None, 16, 512], name="x")
-        y_ = tf.placeholder(tf.float32, [None, 2]) #noise/broad, signal, lowsnr
+        y_ = tf.placeholder(tf.float32, [None, 2]) #noise/broad/lowsnr, signal
         tensor_tup = build_graph(x, y_)
-        misclassified_files = train_and_test(tensor_tup, x, y_, xs, ys, d)
-        copy_files_to_folder(misclassified_files, misclassified_dir)
-    elif mode == 'c':
+        misclassified_files, correctly_classified_files = train_and_test(tensor_tup, x, y_, xs, ys, d)
+        mis_noise, mis_signal = misclassified_files
+        corr_noise, corr_signal = correctly_classified_files
+        copy_files_to_folder(mis_noise, incorrect_noise_dir)
+        copy_files_to_folder(mis_signal, incorrect_signal_dir)
+        copy_files_to_folder(corr_noise, correct_noise_dir)
+        copy_files_to_folder(corr_signal, correct_signal_dir)
+    elif mode == 'cf':
         print "Reading and classifying files from {0}".format(unlabeled_file_dir)
         xs, filenames = prepare_unlabeled_data(unlabeled_file_dir)
-        noise, signal = classifyAll(xs, filenames)
-        copy_files_to_folder(noise, noise_prediction_dir, png = False)
-        copy_files_to_folder(signal, signal_prediction_dir, png = False)
+        noise_filenames, signal_filenames = classify_all_fits_files(xs, filenames)
+        copy_files_to_folder(noise_filenames, noise_prediction_dir, png = False)
+        copy_files_to_folder(signal_filenames, signal_prediction_dir, png = False)
+    elif mode == 'c':
+        WRITE_SIGNAL_CONSTANTLY = True
+        WRITE_NOISE = False
+
+        noise_tups, signal_tups = classify_lazily(write_signal = WRITE_SIGNAL_CONSTANTLY)
+        if not WRITE_SIGNAL_CONSTANTLY:
+            print "Writing {0} predicted signal images to {1}".format(len(signal_tups), signal_prediction_dir)
+            write_image_arrs_to_png(signal_tups, signal_prediction_dir)
+        if WRITE_NOISE:
+            print "Writing {0} predicted noise images to {1}".format(len(noise_tups), noise_prediction_dir)
+            write_image_arrs_to_png(noise_tups, noise_prediction_dir)
+        
     else:
         print "Mode not recognized"
 
